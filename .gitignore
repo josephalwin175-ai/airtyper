@@ -1,0 +1,12 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# downloaded by setup.bat (MediaPipe hand model)
+models/
+
+# per-user state
+settings.json
+airtyper.log
+*.lnk

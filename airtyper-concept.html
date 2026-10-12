@@ -1,0 +1,343 @@
+<title>AirTyper Concept</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one live "camera" stage up top (the product), then a quiet spec sheet below explaining the pipeline. Single dark IR-camera world by choice. */
+:root{
+  --ink:#10122a;          /* page ground, deep indigo */
+  --panel:#181b3a;        /* raised surfaces */
+  --line:#2c3163;         /* hairlines, key borders */
+  --fg:#e8e9f7;           /* primary text */
+  --muted:#9097c9;        /* secondary text */
+  --amber:#ffb547;        /* the single accent: fingertip, active key, caret */
+  --lilac:#a99bff;        /* hand skeleton */
+  --ok:#6fe3a7;
+  --display:"Chakra Petch",ui-sans-serif,system-ui,sans-serif;
+  --body:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{background:var(--ink);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.55}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:28px 64px;display:flex;flex-direction:column;gap:28px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 24px}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(28px,4vw,40px);letter-spacing:.01em;margin:0;text-wrap:balance}
+h1 span{color:var(--amber)}
+.sub{color:var(--muted);margin:0;max-width:60ch}
+
+/* ---------- stage ---------- */
+.stage{position:relative;width:100%;aspect-ratio:16/10;max-width:100%;border-radius:14px;overflow:hidden;border:1px solid var(--line);
+  background:
+    radial-gradient(120% 90% at 50% 20%, #24285a 0%, #14163a 55%, #0b0c22 100%);
+  touch-action:none;user-select:none;cursor:none}
+.stage::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:5% 8%;opacity:.25}
+.silhouette{position:absolute;left:50%;bottom:-6%;width:34%;aspect-ratio:1/1.1;transform:translateX(-50%);
+  border-radius:50% 50% 12% 12%/60% 60% 10% 10%;background:radial-gradient(circle at 50% 30%,#2a2e66,#181a40 70%);opacity:.7}
+.silhouette::before{content:"";position:absolute;left:50%;top:-38%;width:46%;aspect-ratio:1;transform:translateX(-50%);border-radius:50%;background:radial-gradient(circle at 50% 40%,#2e3270,#1a1c46 75%)}
+canvas#hand{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:5}
+
+/* HUD */
+.hud{position:absolute;z-index:6;font-family:var(--mono);font-size:clamp(9px,1.05vw,12px);color:var(--muted);letter-spacing:.04em;pointer-events:none}
+.hud.tl{top:2.2%;left:2%}
+.hud.tr{top:2.2%;right:2%;text-align:right}
+.hud b{color:var(--fg);font-weight:600}
+.rec{display:inline-block;width:.7em;height:.7em;border-radius:50%;background:#ff5d6c;margin-right:.4em;animation:blink 1.4s steps(2) infinite}
+.state{display:inline-block;padding:.15em .6em;border:1px solid var(--line);border-radius:999px;color:var(--fg)}
+.state[data-s="PINCH"],.state[data-s="DWELL ✓"]{border-color:var(--amber);color:var(--amber)}
+
+/* output bar */
+.out{position:absolute;z-index:4;top:11%;left:50%;transform:translateX(-50%);width:78%;
+  background:color-mix(in srgb,var(--ink) 70%,transparent);backdrop-filter:blur(6px);
+  border:1px solid var(--line);border-radius:10px;padding:1.1% 1.8%;display:flex;align-items:center;gap:2%}
+.out .lbl{font-family:var(--mono);font-size:clamp(8px,.9vw,11px);color:var(--muted);letter-spacing:.12em;white-space:nowrap}
+.out .txt{flex:1;min-width:0;font-family:var(--mono);font-size:clamp(12px,2vw,24px);white-space:nowrap;overflow:hidden;text-overflow:clip;direction:rtl;text-align:left}
+.out .txt span{direction:ltr;unicode-bidi:plaintext}
+.caret{display:inline-block;width:.55em;height:1.05em;background:var(--amber);vertical-align:-.15em;animation:blink 1s steps(2) infinite}
+.suggest{position:absolute;z-index:4;top:22.5%;left:50%;transform:translateX(-50%);display:flex;gap:1.2vw}
+.chip{font-family:var(--mono);font-size:clamp(9px,1.1vw,13px);padding:.3em .9em;border-radius:999px;border:1px solid var(--line);background:color-mix(in srgb,var(--panel) 80%,transparent);color:var(--muted)}
+.chip.hot{border-color:var(--amber);color:var(--fg)}
+
+/* keyboard */
+.kb{position:absolute;z-index:3;left:50%;bottom:7%;width:82%;transform:translateX(-50%) perspective(1200px) rotateX(14deg);transform-origin:50% 100%;
+  display:flex;flex-direction:column;gap:1.6%;padding:1.6%;border-radius:14px;
+  background:color-mix(in srgb,var(--panel) 45%,transparent);border:1px solid color-mix(in srgb,var(--line) 70%,transparent);backdrop-filter:blur(3px)}
+.row{display:flex;gap:1%;justify-content:center}
+.key{flex:1 1 0;min-width:0;aspect-ratio:1/0.92;display:grid;place-items:center;border-radius:8px;
+  font-family:var(--display);font-weight:600;font-size:clamp(10px,1.7vw,20px);color:var(--fg);
+  background:color-mix(in srgb,var(--ink) 55%,transparent);border:1px solid var(--line);
+  transition:transform .09s, background .12s, border-color .12s, box-shadow .12s;position:relative}
+.key.w15{flex-grow:1.5;aspect-ratio:auto}.key.w2{flex-grow:2;aspect-ratio:auto}.key.space{flex-grow:6;aspect-ratio:auto}
+.key small{font-family:var(--mono);font-weight:400;font-size:.55em;color:var(--muted);letter-spacing:.06em}
+.key.hover{border-color:var(--amber);background:color-mix(in srgb,var(--amber) 14%,var(--ink));box-shadow:0 0 0 1px var(--amber),0 0 18px color-mix(in srgb,var(--amber) 35%,transparent)}
+.key.press{transform:translateY(3px) scale(.94);background:var(--amber);color:var(--ink)}
+.key.press small{color:var(--ink)}
+.key.on{border-color:var(--lilac)}
+.ring{position:absolute;inset:-3px;border-radius:10px;pointer-events:none;
+  background:conic-gradient(var(--amber) calc(var(--p,0)*1turn),transparent 0);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;padding:3px;opacity:0}
+.key.hover .ring{opacity:1}
+
+.hint{position:absolute;z-index:6;left:50%;bottom:1.6%;transform:translateX(-50%);font-family:var(--mono);font-size:clamp(8px,.95vw,11px);color:var(--muted);white-space:nowrap;pointer-events:none}
+
+/* controls */
+.controls{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;padding:3px;background:var(--panel)}
+.seg button{all:unset;cursor:pointer;font-family:var(--mono);font-size:12px;padding:6px 14px;border-radius:999px;color:var(--muted)}
+.seg button[aria-pressed="true"]{background:var(--amber);color:var(--ink);font-weight:600}
+.seg button:focus-visible,.btn:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.btn{all:unset;cursor:pointer;font-family:var(--mono);font-size:12px;padding:7px 14px;border-radius:999px;border:1px solid var(--line);color:var(--fg)}
+.ctl-label{font-family:var(--mono);font-size:11px;letter-spacing:.12em;color:var(--muted);text-transform:uppercase}
+
+/* spec sheet */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:20px}
+section.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px 22px 18px;min-width:0}
+h2{font-family:var(--display);font-weight:600;font-size:19px;margin:0 0 12px;letter-spacing:.02em}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--amber);margin:0 0 6px}
+ol.pipe{list-style:none;counter-reset:s;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+ol.pipe li{counter-increment:s;display:grid;grid-template-columns:28px 1fr;gap:10px}
+ol.pipe li::before{content:counter(s);font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--lilac);border-radius:6px;height:22px;display:grid;place-items:center;margin-top:1px}
+ol.pipe b,.gest b{font-weight:600}
+.gest{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0}
+.gest dt{font-family:var(--mono);font-size:12px;color:var(--amber);white-space:nowrap;padding-top:2px}
+.gest dd{margin:0;color:var(--fg)}
+ul.plain{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px}
+code{font-family:var(--mono);font-size:.88em;background:var(--ink);border:1px solid var(--line);padding:1px 5px;border-radius:4px}
+.muted{color:var(--muted)}
+
+@keyframes blink{50%{opacity:0}}
+@media (prefers-reduced-motion:reduce){.caret,.rec{animation:none}.key{transition:none}}
+@media (max-width:640px){.suggest{display:none}.hud.tr .extra{display:none}}
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Air<span>Typer</span></h1>
+      <p class="sub">A webcam-driven keyboard that floats over your camera feed. Point with your index finger, pinch your thumb to it, and the key types. Try it below: your mouse or finger stands in for the tracked fingertip.</p>
+    </div>
+  </header>
+
+  <div class="stage" id="stage" aria-label="Simulated AirTyper camera view">
+    <div class="silhouette"></div>
+
+    <div class="hud tl"><span class="rec"></span><b>CAM 0</b> · 1280×720 · mirrored<br><span class="extra">MediaPipe Hands · 21 landmarks</span></div>
+    <div class="hud tr"><span class="state" id="state" data-s="HOVER">HOVER</span><br><span class="extra"><b id="fps">60</b> fps · conf <b id="conf">0.97</b> · <b id="wpm">0</b> wpm</span></div>
+
+    <div class="out"><span class="lbl">OUTPUT</span><div class="txt"><span id="text">hello from the air</span><span class="caret"></span></div></div>
+    <div class="suggest" id="suggest"><span class="chip hot">airtyper</span><span class="chip">air</span><span class="chip">airplane</span></div>
+
+    <div class="kb" id="kb"></div>
+    <canvas id="hand"></canvas>
+    <div class="hint" id="hint">aim with index tip · pinch (click / tap) to type</div>
+  </div>
+
+  <div class="controls">
+    <span class="ctl-label">Press method</span>
+    <div class="seg" role="group" aria-label="Press method">
+      <button id="m-pinch" aria-pressed="true">Pinch</button>
+      <button id="m-dwell" aria-pressed="false">Dwell 600 ms</button>
+    </div>
+    <span class="ctl-label">Smoothing</span>
+    <div class="seg" role="group" aria-label="Smoothing">
+      <button id="s-off" aria-pressed="false">Raw</button>
+      <button id="s-on" aria-pressed="true">One Euro filter</button>
+    </div>
+    <button class="btn" id="clear">Clear text</button>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <p class="eyebrow">Pipeline · per frame</p>
+      <h2>How a keystroke happens</h2>
+      <ol class="pipe">
+        <li><span><b>Capture.</b> OpenCV reads the webcam at 30–60 fps and mirrors it so your hand moves the way you expect.</span></li>
+        <li><span><b>Track.</b> MediaPipe Hands returns 21 landmarks per hand. Landmark 8 is the index tip, 4 is the thumb tip.</span></li>
+        <li><span><b>Smooth.</b> A One Euro filter on the tip removes jitter when you hold still but stays responsive on fast moves.</span></li>
+        <li><span><b>Hit-test.</b> The smoothed tip maps into keyboard space. The nearest key within a 15% snap radius gets the hover state.</span></li>
+        <li><span><b>Detect press.</b> Pinch distance (4↔8) divided by palm width (0↔9). Press below 0.22, release above 0.35, so one pinch is one key.</span></li>
+        <li><span><b>Emit.</b> Send the character to the app's text box, or to the OS with <code>pynput</code> so it types into any window.</span></li>
+      </ol>
+    </section>
+
+    <section class="card">
+      <p class="eyebrow">Gesture set</p>
+      <h2>What your hands do</h2>
+      <dl class="gest">
+        <dt>Point</dt><dd>Index finger aims. The key under it glows amber.</dd>
+        <dt>Pinch</dt><dd>Thumb taps index. Key presses on close, never repeats until you open.</dd>
+        <dt>Dwell</dt><dd>Hold over a key for 600 ms while a ring fills. Accessibility mode for users who can't pinch.</dd>
+        <dt>Palm swipe ←</dt><dd>Open hand sweeps left: delete the last word.</dd>
+        <dt>Fist 1 s</dt><dd>Hide or show the keyboard so you can use the camera normally.</dd>
+        <dt>Two hands</dt><dd>Left hand holds Shift while the right types.</dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <p class="eyebrow">Design rules</p>
+      <h2>Why it looks like this</h2>
+      <ul class="plain">
+        <li>Keys are at least 6% of frame width. Smaller targets fail with webcam jitter.</li>
+        <li>The keyboard sits low and tilts back, so your arm rests near your desk instead of floating at shoulder height.</li>
+        <li>Translucent keys keep your hand visible through them. You need to see your finger to aim.</li>
+        <li>Three-stage feedback: glow on hover, key sinks on press, a short click sound on emit.</li>
+        <li>Word suggestions above the keyboard cut the number of pinches roughly in half.</li>
+        <li>The HUD shows tracking confidence. When it drops under 0.6 the cursor greys out instead of typing garbage.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <p class="eyebrow">Build it</p>
+      <h2>Suggested stack</h2>
+      <ul class="plain">
+        <li><b>Python desktop:</b> <code>opencv-python</code> + <code>mediapipe</code> for tracking, <code>pynput</code> for system typing. Draw the keyboard with OpenCV or a <code>pygame</code> overlay.</li>
+        <li><b>Browser version:</b> MediaPipe Tasks <code>HandLandmarker</code> in JS, <code>&lt;video&gt;</code> + canvas overlay. Zero install, easy to share.</li>
+        <li><b>Milestone 1:</b> fingertip cursor and hover. <b>2:</b> pinch with hysteresis. <b>3:</b> smoothing and snap. <b>4:</b> suggestions and gestures.</li>
+      </ul>
+      <p class="muted" style="margin:12px 0 0">Expect 15–25 wpm once tuned. Physical keyboards sit around 40.</p>
+    </section>
+  </div>
+</div>
+
+<script>
+(() => {
+  const stage = document.getElementById('stage'), kb = document.getElementById('kb'),
+        cv = document.getElementById('hand'), ctx = cv.getContext('2d'),
+        textEl = document.getElementById('text'), stateEl = document.getElementById('state'),
+        wpmEl = document.getElementById('wpm'), confEl = document.getElementById('conf'), fpsEl = document.getElementById('fps');
+
+  const rows = [
+    ['q','w','e','r','t','y','u','i','o','p'],
+    ['a','s','d','f','g','h','j','k','l'],
+    [{k:'shift',l:'⇧',c:'w15',s:'shift'},'z','x','c','v','b','n','m',{k:'bksp',l:'⌫',c:'w15',s:'del'}],
+    [{k:'123',l:'?123',c:'w15'},{k:',',l:','},{k:' ',l:'',c:'space',s:'space'},{k:'.',l:'.'},{k:'enter',l:'↵',c:'w15',s:'enter'}]
+  ];
+  const keys = [];
+  rows.forEach(r => {
+    const row = document.createElement('div'); row.className = 'row';
+    r.forEach(d => {
+      const o = typeof d === 'string' ? {k:d,l:d} : d;
+      const el = document.createElement('div');
+      el.className = 'key ' + (o.c || '');
+      el.innerHTML = (o.s && o.l === '' ? `<small>${o.s}</small>` : o.l) + '<i class="ring"></i>';
+      el.dataset.k = o.k; row.appendChild(el); keys.push(el);
+    });
+    kb.appendChild(row);
+  });
+
+  let text = textEl.textContent, shift = false, mode = 'pinch', smooth = true;
+  let raw = {x:0,y:0}, tip = {x:0,y:0}, pinch = 0, pinchTarget = 0, hovered = null, dwellStart = 0, dwellFired = false;
+  let typed = 0, firstType = 0, lastMove = performance.now(), auto = true;
+
+  function setState(s){ stateEl.textContent = s; stateEl.dataset.s = s; }
+  function render(){ textEl.textContent = text; }
+  function updateSuggest(){
+    const last = (text.split(/\s+/).pop() || '').toLowerCase();
+    const dict = ['airtyper','air','airplane','hello','hand','hands','typing','type','the','this','there','keyboard','keys','from','fingers','pinch','point','camera'];
+    let m = last ? dict.filter(w => w.startsWith(last) && w !== last).slice(0,3) : ['the','hello','hands'];
+    if (!m.length) m = [last || 'the'];
+    document.getElementById('suggest').innerHTML = m.map((w,i)=>`<span class="chip${i?'':' hot'}">${w}</span>`).join('');
+  }
+  function press(el){
+    if (!el) return;
+    const k = el.dataset.k;
+    el.classList.add('press'); setTimeout(()=>el.classList.remove('press'),140);
+    if (k === 'shift'){ shift = !shift; el.classList.toggle('on', shift); return; }
+    if (k === '123') return;
+    if (k === 'bksp') text = text.slice(0,-1);
+    else if (k === 'enter') text += ' ↵ ';
+    else { text += shift ? k.toUpperCase() : k; if (shift){ shift=false; keys.find(e=>e.dataset.k==='shift').classList.remove('on'); } }
+    if (!firstType) firstType = performance.now();
+    typed++; const mins = (performance.now()-firstType)/60000;
+    wpmEl.textContent = mins > 0.05 ? Math.round(typed/5/mins) : 0;
+    render(); updateSuggest();
+  }
+
+  function size(){
+    const r = stage.getBoundingClientRect(), d = devicePixelRatio || 1;
+    cv.width = r.width*d; cv.height = r.height*d; ctx.setTransform(d,0,0,d,0,0);
+  }
+  addEventListener('resize', size); size();
+  { const r = stage.getBoundingClientRect(); raw = {x:r.width*0.52, y:r.height*0.62}; tip = {...raw}; }
+
+  function local(e){ const r = stage.getBoundingClientRect(); return {x:e.clientX-r.left, y:e.clientY-r.top}; }
+  stage.addEventListener('pointermove', e => { raw = local(e); lastMove = performance.now(); auto = false; });
+  stage.addEventListener('pointerdown', e => { raw = local(e); auto = false; lastMove = performance.now(); if (mode==='pinch'){ pinchTarget = 1; } stage.setPointerCapture(e.pointerId); });
+  stage.addEventListener('pointerup', () => { pinchTarget = 0; });
+
+  const setSeg = (a,b,on) => { a.setAttribute('aria-pressed', on); b.setAttribute('aria-pressed', !on); };
+  const mp = document.getElementById('m-pinch'), md = document.getElementById('m-dwell'),
+        so = document.getElementById('s-off'), sn = document.getElementById('s-on');
+  mp.onclick = () => { mode='pinch'; setSeg(mp,md,true); document.getElementById('hint').textContent='aim with index tip · pinch (click / tap) to type'; };
+  md.onclick = () => { mode='dwell'; setSeg(mp,md,false); document.getElementById('hint').textContent='aim with index tip · hold still 600 ms to type'; };
+  so.onclick = () => { smooth=false; setSeg(so,sn,true); };
+  sn.onclick = () => { smooth=true; setSeg(so,sn,false); };
+  document.getElementById('clear').onclick = () => { text=''; typed=0; firstType=0; wpmEl.textContent=0; render(); updateSuggest(); };
+
+  // pointing right hand, offsets from index tip (landmark 8), in units of ~1px at scale 1
+  const OPEN = [[20,230],[-25,205],[-55,175],[-75,145],[-88,118],[-10,120],[-6,75],[-3,35],[0,0],[20,118],[30,85],[36,60],[38,40],[45,125],[55,100],[58,80],[58,65],[65,140],[78,120],[84,105],[86,92]];
+  const PINCHED = {2:[-45,120],3:[-30,60],4:[-6,14]};
+  const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const AMBER = css('--amber'), LILAC = css('--lilac');
+
+  let prevPinch = false, t0 = performance.now(), frames = 0, fpsT = t0;
+  function loop(now){
+    const r = stage.getBoundingClientRect();
+    if (auto){ // idle demo drift
+      const t = now/1000; raw = {x:r.width*(0.5+0.18*Math.sin(t*0.7)), y:r.height*(0.66+0.08*Math.sin(t*1.1))};
+    }
+    const jitter = 2.2; const rx = raw.x + (Math.random()-.5)*jitter*2, ry = raw.y + (Math.random()-.5)*jitter*2;
+    const a = smooth ? 0.28 : 1; tip.x += (rx-tip.x)*a; tip.y += (ry-tip.y)*a;
+    pinch += (pinchTarget-pinch)*0.35;
+
+    // hit test
+    let best = null, bd = Infinity;
+    const sx = tip.x + r.left, sy = tip.y + r.top;
+    for (const k of keys){
+      const b = k.getBoundingClientRect(), cx = b.left+b.width/2, cy = b.top+b.height/2;
+      const dx = Math.max(Math.abs(sx-cx)-b.width/2,0), dy = Math.max(Math.abs(sy-cy)-b.height/2,0), d = Math.hypot(dx,dy);
+      if (d < bd){ bd = d; best = k; }
+    }
+    if (bd > r.width*0.02) best = null;
+    if (best !== hovered){ hovered?.classList.remove('hover'); hovered?.style.setProperty('--p',0); hovered = best; hovered?.classList.add('hover'); dwellStart = now; dwellFired = false; }
+
+    if (mode === 'pinch'){
+      const isP = pinch > 0.6;
+      if (isP && !prevPinch && !auto) press(hovered);
+      prevPinch = isP;
+      setState(isP ? 'PINCH' : (hovered ? 'ARMED' : 'HOVER'));
+      hovered?.style.setProperty('--p', 0);
+    } else {
+      const p = hovered && !auto ? Math.min((now-dwellStart)/600,1) : 0;
+      hovered?.style.setProperty('--p', dwellFired ? 0 : p);
+      if (p >= 1 && !dwellFired){ dwellFired = true; press(hovered); }
+      setState(dwellFired ? 'DWELL ✓' : (hovered ? 'ARMED' : 'HOVER'));
+    }
+
+    // draw hand
+    ctx.clearRect(0,0,r.width,r.height);
+    const sc = r.width/1100;
+    const pts = OPEN.map((p,i) => { let q = p; if (PINCHED[i]) q = [p[0]+(PINCHED[i][0]-p[0])*pinch, p[1]+(PINCHED[i][1]-p[1])*pinch]; return [tip.x+q[0]*sc*1.6, tip.y+q[1]*sc*1.6]; });
+    ctx.lineCap='round'; ctx.lineWidth = Math.max(1.5, 3*sc*1.6);
+    ctx.strokeStyle = LILAC; ctx.globalAlpha = .85;
+    ctx.beginPath(); BONES.forEach(([i,j]) => { ctx.moveTo(...pts[i]); ctx.lineTo(...pts[j]); }); ctx.stroke();
+    ctx.globalAlpha = 1;
+    pts.forEach((p,i) => { if (i===8) return; ctx.fillStyle = (i===4) ? AMBER : LILAC; ctx.beginPath(); ctx.arc(p[0],p[1],Math.max(2,4*sc*1.6),0,7); ctx.fill(); });
+    // pinch line
+    ctx.setLineDash([4,4]); ctx.strokeStyle = AMBER; ctx.globalAlpha = .7; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(...pts[4]); ctx.lineTo(...pts[8]); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+    // fingertip reticle
+    const R = Math.max(7, 12*sc*1.6);
+    ctx.strokeStyle = AMBER; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(tip.x,tip.y,R*(1-0.35*pinch),0,7); ctx.stroke();
+    ctx.fillStyle = AMBER; ctx.beginPath(); ctx.arc(tip.x,tip.y,3,0,7); ctx.fill();
+    [[0,-1],[0,1],[-1,0],[1,0]].forEach(([dx,dy]) => { ctx.beginPath(); ctx.moveTo(tip.x+dx*R*1.3,tip.y+dy*R*1.3); ctx.lineTo(tip.x+dx*R*1.8,tip.y+dy*R*1.8); ctx.stroke(); });
+
+    frames++; if (now-fpsT > 500){ fpsEl.textContent = Math.round(frames*1000/(now-fpsT)); frames=0; fpsT=now; confEl.textContent = (0.94+Math.random()*0.05).toFixed(2); }
+    requestAnimationFrame(loop);
+  }
+  render(); updateSuggest(); requestAnimationFrame(loop);
+})();
+</script>
