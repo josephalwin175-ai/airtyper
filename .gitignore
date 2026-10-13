@@ -10,3 +10,6 @@ models/
 settings.json
 airtyper.log
 *.lnk
+
+# hand recordings made with Ctrl+Alt+F9
+recordings/
