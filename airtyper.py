@@ -17,17 +17,26 @@ GESTURE MODE (rock, Ctrl+Alt+A or the Gestures button)  - edit gestures.json to 
   Two-finger swipe down -> clipboard shelf: your last catches; hand height picks one, catch takes it
   Hold other shapes -> launchers, pinky = close app
 
+LINK (two laptops on the same Wi-Fi, both running AirTyper)
+  Two-finger swipe up (or Ctrl+Alt+L) -> Link panel: pair with push + matching codes (thumbs up)
+  Carry an item to the screen edge where your friend sits and flick it open -> it flies to their laptop
+  When something arrives, catch -> it's in your fist; drop it anywhere. Their hands show as ghosts.
+
 WINDOW
   Drag the header to move it (position is remembered). Buttons: ?, 1H/2H, Gestures, close.
 
 HOTKEYS (Ctrl+Alt + ...)
   Up/Down sensitivity  R re-centre  M pinch/dwell  D one/two hands  A gestures  V shelf  G guide  H hide
+  L Link panel  K Link on/off
   F9 record hand data (for replay.py)  Q quit
 """
 import ctypes
+import io
 import json
 import math
 import os
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -46,6 +55,11 @@ from pynput.mouse import Controller as MouseController
 
 from gesture_engine import Engine, OneEuro
 
+try:
+    from link import SIDES, Link, local_ipv4s
+except ImportError:  # cryptography missing: AirTyper still runs, without Link
+    Link, SIDES, local_ipv4s = None, ("right", "left", "top"), lambda: []
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, "models", "hand_landmarker.task")
 SETTINGS = os.path.join(HERE, "settings.json")
@@ -53,6 +67,10 @@ GESTURES = os.path.join(HERE, "gestures.json")
 RECORDINGS = os.path.join(HERE, "recordings")
 WIN = "AirTyper"
 CHIP = "AirTyper carry"  # small floating label that follows the cursor while you carry an item
+PORTAL = "AirTyper portal"  # glowing drop zones at the screen edges where linked friends sit
+APPDATA_DIR = os.path.join(os.environ.get("APPDATA", HERE), "AirTyper")
+LINK_IDENTITY = os.path.join(APPDATA_DIR, "link.json")
+RECEIVED = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "AirTyper", "Received")
 
 # ---------- tuning ----------
 # width of the hand-movement box (fraction of camera width) spanning the whole keyboard; smaller = more sensitive
@@ -79,6 +97,10 @@ DRAG_PRECISION = 0.6              # pointer speed while the mouse button is held
 CARRY_START = 0.05                # fist travel (square camera units) before a held item starts carrying the cursor
 SHELF_SIZE = 8                    # clipboard shelf: last catches kept (memory only, cleared on quit)
 EASE = 24.0                       # display cursor easing rate (higher = snappier)
+PORTAL_ZONE = 70                  # px from a screen edge where a carried item drops into a friend's portal
+INCOMING_FRESH = 25.0             # s an arrived item waits on the gesture card for a catch
+GHOST_HZ = 15                     # hand skeletons sent to linked friends per second
+RISKY_EXT = {".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".scr", ".com", ".lnk", ".jar", ".hta", ".reg"}
 RENDER_FPS = 60
 
 # ---------- palette (BGR) ----------
@@ -92,6 +114,7 @@ ACCENT = (255, 170, 80)
 ACCENT_DIM = (150, 110, 60)
 AMBER = (64, 190, 255)
 RED = (96, 96, 240)
+GHOST = (230, 130, 205)  # a linked friend's hands
 
 
 def mix(a, b, t):
@@ -169,6 +192,18 @@ kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
                                                 ctypes.POINTER(wintypes.DWORD)]
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 CF_UNICODETEXT = 13
+CF_DIB, CF_HDROP = 8, 15
+shell32 = ctypes.windll.shell32
+shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+shell32.DragQueryFileW.restype = wintypes.UINT
+kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalSize.restype = ctypes.c_size_t
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterClipboardFormatW.restype = wintypes.UINT
+# password managers mark what they copy with these; such items never leave this laptop
+CF_EXCLUDE = user32.RegisterClipboardFormatW("ExcludeClipboardContentFromMonitorProcessing")
+CF_HISTORY = user32.RegisterClipboardFormatW("CanIncludeInClipboardHistory")
 
 
 def dpi_aware():
@@ -238,24 +273,141 @@ def clip_get_text():
         user32.CloseClipboard()
 
 
-def clip_set_text(s):
-    data = ctypes.create_unicode_buffer(s)
-    size = ctypes.sizeof(data)
-    h = kernel32.GlobalAlloc(0x0002, size)  # GMEM_MOVEABLE
+def clip_put(fmt, data):
+    h = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
     if not h:
         return
     p = kernel32.GlobalLock(h)
-    ctypes.memmove(p, data, size)
+    ctypes.memmove(p, data, len(data))
     kernel32.GlobalUnlock(h)
     if not open_clipboard():
         kernel32.GlobalFree(h)
         return
     try:
         user32.EmptyClipboard()
-        if not user32.SetClipboardData(CF_UNICODETEXT, h):
+        if not user32.SetClipboardData(fmt, h):
             kernel32.GlobalFree(h)
     finally:
         user32.CloseClipboard()
+
+
+def clip_set_text(s):
+    clip_put(CF_UNICODETEXT, (s + "\0").encode("utf-16-le"))
+
+
+def _global_bytes(h):
+    p = kernel32.GlobalLock(h)
+    if not p:
+        return None
+    try:
+        return ctypes.string_at(p, kernel32.GlobalSize(h))
+    finally:
+        kernel32.GlobalUnlock(h)
+
+
+def dib_to_png(dib):
+    bi_size, = struct.unpack_from("<I", dib, 0)
+    bits, = struct.unpack_from("<H", dib, 14)
+    comp, clr_used = struct.unpack_from("<I", dib, 16)[0], struct.unpack_from("<I", dib, 32)[0]
+    colors = clr_used or (1 << bits if bits <= 8 else 0)
+    masks = 12 if comp == 3 and bi_size == 40 else 0
+    bmp = b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, 14 + bi_size + masks + colors * 4) + dib
+    im = Image.open(io.BytesIO(bmp)).convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, "PNG", compress_level=3)
+    return buf.getvalue(), im.size
+
+
+def png_to_dib(png):
+    buf = io.BytesIO()
+    Image.open(io.BytesIO(png)).convert("RGB").save(buf, "BMP")
+    return buf.getvalue()[14:]
+
+
+def item_label(item):
+    k = item["kind"]
+    if item.get("private"):
+        return "Private item (password manager)"
+    if k == "text":
+        t = " ".join(item["text"][:2000].split())[:300]
+        if item.get("url"):
+            return "Link · " + t.split("://", 1)[-1]
+        return t
+    if k == "image":
+        w, h = item.get("size") or Image.open(io.BytesIO(item["png"])).size
+        return f"Image {w}×{h}"
+    names = [os.path.basename(os.path.normpath(p)) for p in item["paths"]]
+    return names[0] if len(names) == 1 else f"{len(names)} items · {', '.join(names[:2])}…"
+
+
+def finish_item(item):
+    """Fill in label / url / risky flags for a clipboard or received item."""
+    if item["kind"] == "text":
+        t = item["text"].strip()
+        item["url"] = t.lower().startswith(("http://", "https://")) and not any(c.isspace() for c in t)
+    if item["kind"] == "files":
+        risky = False
+        for p in item["paths"]:
+            for root, _, files in (os.walk(p) if os.path.isdir(p) else [("", None, [p])]):
+                risky = risky or any(os.path.splitext(f)[1].lower() in RISKY_EXT for f in files)
+        item["risky"] = risky
+    item["label"] = item.get("label") or item_label(item)
+    return item
+
+
+def clip_read_item():
+    """What the clipboard holds right now: files, text or an image (None if nothing usable)."""
+    if not open_clipboard():
+        return None
+    dib, item = None, None
+    try:
+        private = bool(CF_EXCLUDE and user32.IsClipboardFormatAvailable(CF_EXCLUDE))
+        if not private and CF_HISTORY and user32.IsClipboardFormatAvailable(CF_HISTORY):
+            b = _global_bytes(user32.GetClipboardData(CF_HISTORY) or 0) or b""
+            private = len(b) >= 4 and struct.unpack_from("<I", b)[0] == 0
+        if user32.IsClipboardFormatAvailable(CF_HDROP):
+            h = user32.GetClipboardData(CF_HDROP)
+            paths = []
+            for i in range(shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0) if h else 0):
+                n = shell32.DragQueryFileW(h, i, None, 0)
+                buf = ctypes.create_unicode_buffer(n + 1)
+                shell32.DragQueryFileW(h, i, buf, n + 1)
+                paths.append(buf.value)
+            if paths:
+                item = {"kind": "files", "paths": paths}
+        if item is None and user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            h = user32.GetClipboardData(CF_UNICODETEXT)
+            p = kernel32.GlobalLock(h) if h else None
+            if p:
+                try:
+                    item = {"kind": "text", "text": ctypes.wstring_at(p)}
+                finally:
+                    kernel32.GlobalUnlock(h)
+        if item is None and user32.IsClipboardFormatAvailable(CF_DIB):
+            h = user32.GetClipboardData(CF_DIB)
+            dib = _global_bytes(h) if h else None
+    finally:
+        user32.CloseClipboard()
+    if dib:
+        try:
+            png, size = dib_to_png(dib)
+            item = {"kind": "image", "png": png, "size": size}
+        except Exception:
+            item = None
+    if item is None:
+        return None
+    item["private"] = private
+    return finish_item(item)
+
+
+def clip_set_item(item):
+    k = item["kind"]
+    if k == "text":
+        clip_set_text(item["text"])
+    elif k == "image":
+        clip_put(CF_DIB, png_to_dib(item["png"]))
+    else:  # DROPFILES header + double-null-terminated wide paths: Explorer pastes the real files
+        clip_put(CF_HDROP, struct.pack("<IiiII", 20, 0, 0, 0, 1) + ("\0".join(item["paths"]) + "\0\0").encode("utf-16-le"))
 
 
 TERMINAL_CLASSES = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty", "VirtualConsoleClass"}
@@ -319,6 +471,7 @@ DEFAULT_GESTURES = {
         "two_swipe_left": {"name": "Switch app", "keys": "alt+tab"},
         "two_swipe_right": {"name": "Switch app back", "keys": "alt+shift+tab"},
         "two_swipe_down": {"name": "Clipboard shelf", "action": "shelf"},
+        "two_swipe_up": {"name": "Link", "action": "link"},
         "push": {"name": "Play / pause", "keys": "media_play_pause"},
         "zoom_in": {"name": "Zoom in", "keys": "ctrl+="},
         "zoom_out": {"name": "Zoom out", "keys": "ctrl+-"},
@@ -499,13 +652,21 @@ class AirTyper:
         self.shelf_y = self.cam_y + self.cam_h_type + 10
         self.shelf_row = 36
         h_shelf = self.shelf_y + 30 + SHELF_SIZE * self.shelf_row + 34
-        # guide: rows shrink a little on short screens
-        self.help_rows = self.build_help()
-        n_sec = sum(1 for _, a in self.help_rows if a is None)
-        n_row = len(self.help_rows) - n_sec
-        self.help_row_h = int(np.clip((b - t - 40 - self.header_h - 58 - n_sec * 28) / n_row, 17, 21))
-        h_help = self.header_h + 6 + n_sec * 28 + n_row * self.help_row_h + 52
-        self.heights = {"type": h_type, "control": h_ctrl, "shelf": h_shelf, "help": max(h_type, h_help)}
+        # Link panel
+        self.link_row = 58
+        h_link = self.shelf_y + 30 + 4 * self.link_row + 40
+        # guide: two pages, rows shrink a little on short screens
+        self.help_pages = self.build_help()
+        self.help_page = 0
+        need = []
+        for rows in self.help_pages:
+            n_sec = sum(1 for _, a in rows if a is None)
+            n_row = len(rows) - n_sec
+            need.append((n_sec, n_row))
+        self.help_row_h = int(min(np.clip((b - t - 40 - self.header_h - 58 - ns * 28) / nr, 17, 21) for ns, nr in need))
+        h_help = max(self.header_h + 6 + ns * 28 + nr * self.help_row_h + 52 for ns, nr in need)
+        self.heights = {"type": h_type, "control": h_ctrl, "shelf": h_shelf, "link": h_link,
+                        "help": max(h_type, h_help)}
         self.layout = "type"
         self.H = h_type
 
@@ -558,7 +719,7 @@ class AirTyper:
         self.ripples = []
         self.target, self.target_t = "", 0.0
         self.hwnd = None
-        self.toast, self.toast_t = "", 0.0
+        self.toast, self.toast_t, self.toast_dur = "", 0.0, 1.6
         self.last_real_key = 0.0
         self.sug_dirty = False
         self.booting = True
@@ -584,6 +745,21 @@ class AirTyper:
         self.scroll_vel = self.scroll_glide = 0.0     # measured units/s while pinching / gliding speed after
         self.scrolling = False
         self.sprites = {}
+        self.held_item = None         # what a catch holds: {"kind": text|image|files, "label", ...}
+        # Link
+        self.link = None
+        self.link_enabled = bool(self.settings.get("link_enabled", True))
+        self.link_name = str(self.settings.get("link_name") or socket.gethostname())[:40]
+        self.link_toggle = False
+        self.link_view, self.link_view_t, self.link_conn = [], 0.0, []
+        self.link_ips, self.link_ips_t = "", 0.0
+        self.show_link, self.link_sel = False, 0
+        self.link_hits = []           # clickable rects drawn this frame: (x0, y0, x1, y1, fn)
+        self.incoming = None          # (item, time) just arrived from a friend
+        self.transfers = {}           # id -> {"dir", "name", "frac", "done", "t"}
+        self.ghosts = {}              # peer id -> (hands, holding, time)
+        self.ghost_t = 0.0
+        self.portals = {}             # side -> {"hwnd", "key", "img", "shown"}
         self.proc = (None, "")    # (hwnd, process name) cache
         self.fx_swipe = self.fx_splash = self.fx_catch = None
         self.rec, self.rec_toggle = None, False
@@ -599,6 +775,8 @@ class AirTyper:
             "<ctrl>+<alt>+a": self.toggle_ai,
             "<ctrl>+<alt>+g": self.toggle_help,
             "<ctrl>+<alt>+v": self.toggle_shelf,
+            "<ctrl>+<alt>+l": self.toggle_link_panel,
+            "<ctrl>+<alt>+k": self.request_link_toggle,
             "<ctrl>+<alt>+<f9>": self.request_rec,
             "<ctrl>+<alt>+<up>": lambda: self.change_sens(1),
             "<ctrl>+<alt>+<down>": lambda: self.change_sens(-1),
@@ -608,9 +786,10 @@ class AirTyper:
         self.real_keys.start()
 
     def make_buttons(self, layout):
-        names = {"type": ("close", "gest", "hands", "help"), "control": ("close", "gest", "clips", "help"),
-                 "shelf": ("close", "gest", "clips", "help"), "help": ("close", "help")}[layout]
-        widths = {"close": 28, "gest": 78, "hands": 38, "clips": 48, "help": 28}
+        gesture = ("close", "gest", "clips", "link", "help")
+        names = {"type": ("close", "gest", "hands", "help"), "control": gesture, "shelf": gesture, "link": gesture,
+                 "help": ("close", "help")}[layout]
+        widths = {"close": 28, "gest": 74, "hands": 38, "clips": 46, "link": 42, "help": 28}
         bx, out = self.W - self.pad, {}
         for n in names:
             out[n] = (bx - widths[n], 9, bx, 35)
@@ -643,12 +822,19 @@ class AirTyper:
             ("Flick open without moving", "Paste at the caret"),
             ("Open the hand slowly", "Cancel"),
             ("Two-finger swipe down", nm(m, "two_swipe_down") + "  (Ctrl+Alt+V)"),
+        ]
+        page2 = [
+            ("Link  (two laptops, same Wi-Fi)", None),
+            ("Two-finger swipe up", "Link panel  (Ctrl+Alt+L)"),
+            ("In the panel: push / thumbs up", "Pair / codes match"),
+            ("Carry to a friend's edge, flick open", "Throw it to them"),
+            ("Catch when something arrives", "Take it, then drop it"),
             ("Hold still", None),
             ("One finger", "Air pointer"),
         ]
-        rows += [(POSE_LABELS[g], p[g].get("name", g)) for g in POSE_ORDER if g in p]
-        rows += [("Pinky", "Close active app"), ("Rock (index + pinky)", "Gestures ↔ typing")]
-        return rows
+        page2 += [(POSE_LABELS[g], p[g].get("name", g)) for g in POSE_ORDER if g in p]
+        page2 += [("Pinky", "Close active app"), ("Rock (index + pinky)", "Gestures ↔ typing")]
+        return [rows, page2]
 
     # ---------- controls ----------
     def quit(self):
@@ -682,15 +868,34 @@ class AirTyper:
         self.engine_reset = True  # applied on the detection thread's next frame, in the main loop
         self.held_text, self.pending_copy = None, None
         self.carrying, self.pointing = False, False
+        self.held_item = None
         if not self.ai_mode:
-            self.show_shelf = False
+            self.show_shelf = self.show_link = False
         self.say("Gesture mode" if self.ai_mode else "Typing mode")
 
     def toggle_help(self):
-        self.show_help = not self.show_help
+        """? / Ctrl+Alt+G: page 1, page 2, closed."""
+        if not self.show_help:
+            self.show_help, self.help_page = True, 0
+        elif self.help_page == 0:
+            self.help_page = 1
+        else:
+            self.show_help = False
+
+    def toggle_link_panel(self):
+        self.show_link = not self.show_link
+        self.show_shelf = False
+        self.link_sel = 0
+        self.link_view_t = 0.0
+        if self.show_link and not self.ai_mode:
+            self.toggle_ai()
+
+    def request_link_toggle(self):
+        self.link_toggle = True
 
     def toggle_shelf(self):
         self.show_shelf = not self.show_shelf
+        self.show_link = False
         self.shelf_sel = 0
         if self.show_shelf and not self.ai_mode:
             self.toggle_ai()
@@ -699,13 +904,13 @@ class AirTyper:
         self.sens = int(np.clip(self.sens + d, 0, len(SENS_LEVELS) - 1))
         self.say(f"Sensitivity {self.sens + 1}/{len(SENS_LEVELS)}")
 
-    def say(self, msg):
-        self.toast, self.toast_t = msg, time.perf_counter()
+    def say(self, msg, dur=1.6):
+        self.toast, self.toast_t, self.toast_dur = msg, time.perf_counter(), dur
 
-    def act(self, title, detail=""):
+    def act(self, title, detail="", dur=1.6):
         self.last_action = (title, detail, time.perf_counter())
         if not self.ai_mode:
-            self.say(title)
+            self.say(title, dur)
 
     def save_settings(self):
         if self.hwnd:
@@ -718,7 +923,8 @@ class AirTyper:
         data = dict(self.settings)
         data.pop("pos", None)
         data.update({"pos_lb": [self.pos[0], bottom], "sens": self.sens, "dual": self.dual, "mode": self.mode,
-                     "hold_only_clipboard": self.hold_only, "natural_scroll": self.natural_scroll})
+                     "hold_only_clipboard": self.hold_only, "natural_scroll": self.natural_scroll,
+                     "link_enabled": self.link_enabled})
         save_json(SETTINGS, data)
 
     def on_mouse(self, event, x, y, flags, param):
@@ -727,7 +933,11 @@ class AirTyper:
         for name, (x0, y0, x1, y1) in self.buttons_by[self.layout].items():
             if x0 <= x <= x1 and y0 <= y <= y1:
                 {"close": self.quit, "gest": self.toggle_ai, "hands": self.toggle_dual,
-                 "clips": self.toggle_shelf, "help": self.toggle_help}[name]()
+                 "clips": self.toggle_shelf, "link": self.toggle_link_panel, "help": self.toggle_help}[name]()
+                return
+        for x0, y0, x1, y1, fn in self.link_hits:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                fn()
                 return
         if y < self.header_h and self.hwnd:
             # native window drag from the header
@@ -779,6 +989,8 @@ class AirTyper:
             except Exception:
                 pass
         self.chip_setup()
+        for side in SIDES:
+            self.portals[side] = {"hwnd": self.make_overlay(f"{PORTAL} {side}"), "key": None, "shown": False}
         if prev and prev != hwnd:
             user32.SetForegroundWindow(prev)
         self.hwnd = hwnd
@@ -901,7 +1113,8 @@ class AirTyper:
         name = a.get("name", detail)
         try:
             if "action" in a:
-                {"shelf": self.toggle_shelf, "clipboard_history": lambda: self.send_combo("win+v")}[a["action"]]()
+                {"shelf": self.toggle_shelf, "link": self.toggle_link_panel,
+                 "clipboard_history": lambda: self.send_combo("win+v")}[a["action"]]()
             elif "keys" in a:
                 self.send_combo(a["keys"])
             else:
@@ -928,7 +1141,9 @@ class AirTyper:
         t = e["type"]
         if t == "pose":
             g = e["id"]
-            if g == "rock":
+            if self.show_link and g in ("thumbs_up", "thumbs_down"):
+                self.link_pose(g)
+            elif g == "rock":
                 self.toggle_ai()
             elif not self.ai_mode:
                 return
@@ -941,7 +1156,10 @@ class AirTyper:
             self.fx_swipe = (e["dir"], now)
             self.run_action(self.lookup(name), ("Two-finger swipe " if e["two"] else "Swipe ") + e["dir"])
         elif t == "push":
-            self.run_action(self.lookup("push"), "Push")
+            if self.show_link:
+                self.link_primary()
+            else:
+                self.run_action(self.lookup("push"), "Push")
         elif t == "zoom":
             self.run_action(self.lookup("zoom_in" if e["n"] > 0 else "zoom_out"), "Two-hand pinch")
         elif t == "scroll":
@@ -1047,23 +1265,35 @@ class AirTyper:
                 self.scroll_frac -= units
                 self.mouse.scroll(0, units / 120)  # high-resolution wheel: smooth in browsers and editors
 
-    def shelf_add(self, text):
-        if text in self.shelf:
-            self.shelf.remove(text)
-        self.shelf.appendleft(text)
+    def shelf_add(self, item):
+        if item.get("private"):
+            return
+        for old in list(self.shelf):
+            if old["kind"] == item["kind"] and old["label"] == item["label"] and old.get("from") == item.get("from"):
+                self.shelf.remove(old)
+        self.shelf.appendleft(item)
+
+    def hold(self, item):
+        self.held_item, self.held_text = item, item["label"]
 
     def copy_begin(self, now):
         self.carrying, self.carry_off = False, [0.0, 0.0]
         self.fx_catch = now
+        if self.show_link:  # the Link panel uses push / thumbs; a fist there means nothing
+            self.engine.holder = None
+            return
+        if self.incoming and not self.show_shelf and now - self.incoming[1] < INCOMING_FRESH:
+            self.take_incoming(hold=True)
+            return
         if self.show_shelf:
             if not self.shelf:
                 self.engine.holder = None
                 self.act("The shelf is empty", "Catch")
                 return
-            text = self.shelf[min(self.shelf_sel, len(self.shelf) - 1)]
-            clip_set_text(text)
-            self.held_text = text
-            self.shelf_add(text)
+            item = self.shelf[min(self.shelf_sel, len(self.shelf) - 1)]
+            clip_set_item(item)
+            self.hold(item)
+            self.shelf_add(item)
             self.show_shelf = False
             self.act("Taken from the shelf", "Move the fist to carry it")
             return
@@ -1074,7 +1304,7 @@ class AirTyper:
             return
         self.clip_prev = clip_get_text() if self.hold_only else None
         self.pending_copy = (now, user32.GetClipboardSequenceNumber(), False)
-        self.held_text = None
+        self.held_text = self.held_item = None
         self.send_combo("ctrl+shift+c" if self.is_terminal(fg) else "ctrl+c")
 
     def poll_copy(self, now):
@@ -1083,10 +1313,10 @@ class AirTyper:
         t0, seq0, grabbed = self.pending_copy
         if user32.GetClipboardSequenceNumber() != seq0:
             self.pending_copy = None
-            text = clip_get_text()
-            self.held_text = text or "(copied, not text)"
-            if text and text.strip():
-                self.shelf_add(text)
+            item = clip_read_item() or finish_item({"kind": "text", "text": ""})
+            self.hold(item)
+            if item["kind"] != "text" or item["text"].strip():
+                self.shelf_add(item)
             self.act("Grabbed the word" if grabbed else "Copied", "Move the fist to carry it")
         elif self.pointing and not grabbed and now - t0 > WORD_GRAB_WAIT:
             # nothing was selected: double-click selects the word under the air pointer, then copy it
@@ -1095,12 +1325,18 @@ class AirTyper:
             self.send_combo("ctrl+c")
         elif now - t0 > COPY_TIMEOUT:
             self.pending_copy = None
-            self.held_text = None
+            self.held_text = self.held_item = None
             self.engine.holder = None
             self.act("Nothing selected to copy", "Select text first, then catch")
 
     def paste(self, now, tid):
         dropped_here = self.carrying
+        side = self.portal_hot() if dropped_here else None
+        if side:  # dropped into a friend's portal: throw it to their laptop
+            self.throw(now, *side)
+            self.carrying, self.carry_off = False, [0.0, 0.0]
+            self.held_text = self.held_item = self.clip_prev = self.pending_copy = None
+            return
         if dropped_here:
             self.snap_ptr()
             self.mouse.click(Button.left)  # place the caret where the fist carried the item
@@ -1112,7 +1348,7 @@ class AirTyper:
         if tr is not None and tr.lm is not None:
             self.fx_splash = (now, sum(tr.lm[i].x for i in (0, 5, 9, 13, 17)) / 5,
                               sum(tr.lm[i].y for i in (0, 5, 9, 13, 17)) / 5)
-        self.held_text, self.clip_prev, self.pending_copy = None, None, None
+        self.held_text, self.held_item, self.clip_prev, self.pending_copy = None, None, None, None
         self.act("Dropped here" if dropped_here else "Pasted at the caret", "Splash")
 
     def drop(self, reason):
@@ -1124,7 +1360,177 @@ class AirTyper:
             else:
                 msg = "Dropped · still on the clipboard"
             self.act(msg, "Hand lost" if reason == "lost" else "Opened slowly")
-        self.held_text, self.clip_prev, self.pending_copy = None, None, None
+        self.held_text, self.held_item, self.clip_prev, self.pending_copy = None, None, None, None
+
+    # ---------- Link ----------
+    def link_start(self):
+        if Link is None:
+            self.say("Link needs the cryptography package (run setup.bat)")
+            return
+        try:
+            self.link = Link(self.link_name, LINK_IDENTITY, RECEIVED, manual=self.settings.get("link_manual", []))
+            self.link.start()
+        except OSError as e:
+            self.link = None
+            self.say(f"Link unavailable: {e.__class__.__name__}")
+
+    def link_stop(self):
+        if self.link:
+            self.link.stop()
+            self.link = None
+        self.link_view, self.link_conn, self.ghosts = [], [], {}
+
+    def peer_name(self, pid):
+        return next((p["name"] for p in self.link_view if p["id"] == pid), "your friend")
+
+    def pump_link(self, now):
+        if self.link_toggle:
+            self.link_toggle = False
+            self.link_enabled = not self.link_enabled
+            (self.link_start if self.link_enabled else self.link_stop)()
+            self.say("Link on" if self.link_enabled else "Link off")
+        if not self.link:
+            return
+        for e in self.link.poll():
+            t = e["type"]
+            if t not in ("ghost", "progress"):
+                self.link_view_t = 0.0  # refresh the device list
+            if t == "connected":
+                self.act(f"Linked with {e['name']}", "Link", dur=4.0)
+            elif t == "disconnected":
+                self.ghosts.pop(e["peer"], None)
+                self.act(f"{e['name']} went offline", "Link")
+            elif t == "pair_request":
+                self.act(f"{e['name']} wants to pair", "Open Link: two-finger swipe up", dur=4.0)
+                if self.ai_mode and not self.show_link:
+                    self.toggle_link_panel()
+            elif t == "pair_code":
+                if self.ai_mode and not self.show_link:
+                    self.toggle_link_panel()
+                self.act("Do both screens show the same code?", "Thumbs up or Confirm")
+            elif t == "paired":
+                self.act(f"Paired with {e['name']}", "Carry something to the screen edge to throw it")
+            elif t == "pair_failed":
+                self.act(e.get("reason") or "Pairing stopped", "Link")
+            elif t == "error":
+                self.act(e["message"], "Link")
+            elif t == "progress":
+                tr = self.transfers.setdefault(e["id"], {"dir": e["dir"], "name": self.peer_name(e["peer"])})
+                tr.update(frac=e["frac"], done=e["done"], t=now)
+            elif t == "transfer_failed":
+                self.transfers.pop(e["id"], None)
+                self.act("A transfer stopped (connection lost)", "Link")
+            elif t == "item":
+                item = finish_item(e["item"])
+                self.shelf_add(item)
+                self.incoming = (item, now)
+                what = {"text": "a link" if item.get("url") else "some text", "image": "an image",
+                        "files": "files"}[item["kind"]]
+                self.act(f"{item['from']} threw you {what}", "Catch to take it" if self.ai_mode else "Ctrl+Alt+V shelf", dur=4.0)
+            elif t == "taken":
+                self.act(f"{e['name']} caught it", "Link")
+            elif t == "ghost":
+                self.ghosts[e["peer"]] = (e["hands"], e["holding"], now)
+        if now - self.link_ips_t > 5:
+            self.link_ips_t, self.link_ips = now, ", ".join(local_ipv4s()[:2])
+        if now - self.link_view_t > 0.5:
+            self.link_view_t = now
+            self.link_view = self.link.snapshot()
+            self.link_conn = self.link.connected()
+            if self.link_sel >= max(1, len(self.link_view)):
+                self.link_sel = max(0, len(self.link_view) - 1)
+
+    def take_incoming(self, hold):
+        item, _ = self.incoming
+        self.incoming = None
+        clip_set_item(item)
+        if hold:
+            self.hold(item)
+            self.fx_catch = time.perf_counter()
+        else:
+            self.engine.holder = None
+        if self.link:
+            self.link.taken(item["peer"], item["tid"])
+        self.act(f"Caught from {item['from']}", "Move the fist to carry it" if hold else "On your clipboard: Ctrl+V")
+
+    def open_incoming_url(self):
+        item, _ = self.incoming
+        url = item["text"].strip()
+        if item.get("url") and url.lower().startswith(("http://", "https://")):
+            os.startfile(url)
+            self.incoming = None
+            self.act("Opened the link", item["from"])
+
+    def screen_rect(self):
+        vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+        return vx, vy, vx + user32.GetSystemMetrics(78), vy + user32.GetSystemMetrics(79)
+
+    def portal_hot(self):
+        """(peer id, name, side) whose screen-edge portal the cursor is in, or None."""
+        if not self.link_conn:
+            return None
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        x0, y0, x1, y1 = self.screen_rect()
+        near = {"right": pt.x >= x1 - PORTAL_ZONE, "left": pt.x <= x0 + PORTAL_ZONE, "top": pt.y <= y0 + PORTAL_ZONE}
+        return next(((pid, name, side) for pid, name, side in self.link_conn if near.get(side)), None)
+
+    def throw(self, now, pid, name, side):
+        item = self.held_item
+        if item is None:
+            self.act("Still copying, catch it again", "Throw")
+            return
+        if item.get("private"):
+            self.act("Private items stay on this laptop", "Password manager")
+            return
+        send = {k: item[k] for k in ("kind", "label", "text", "png", "paths") if k in item}
+        tid = self.link.send_item(pid, send) if self.link else None
+        if tid:
+            self.transfers[tid] = {"dir": "out", "name": name, "frac": 0.0, "done": False, "t": now}
+            self.fx_swipe = ({"right": "right", "left": "left", "top": "up"}[side], now)
+            self.act(f"Thrown to {name}", item["label"][:40])
+        else:
+            self.act(f"Could not send to {name}", "Link")
+
+    def link_selected(self):
+        return self.link_view[self.link_sel] if 0 <= self.link_sel < len(self.link_view) else None
+
+    def link_primary(self, p=None):
+        """Push or the row button: the obvious next step for that device."""
+        p = p or self.link_selected()
+        if not p or not self.link:
+            return
+        if p["pair"] == "incoming":
+            self.link.accept_pair(p["id"])
+        elif p["pair"] == "code":
+            self.link.confirm_pair(p["id"])
+        elif not p["paired"] and not p["pair"] and p["online"]:
+            self.link.request_pair(p["id"])
+            self.act(f"Asking {p['name']} to pair", "They push or click Accept")
+        self.link_view_t = 0.0
+
+    def link_pose(self, g):
+        p = next((d for d in self.link_view if d["pair"] in ("code", "incoming")), None) or self.link_selected()
+        if not p or not self.link:
+            return
+        if g == "thumbs_up" and p["pair"] == "code":
+            self.link.confirm_pair(p["id"])
+        elif g == "thumbs_down" and p["pair"]:
+            self.link.cancel_pair(p["id"])
+        self.link_view_t = 0.0
+
+    def link_cycle_side(self, p):
+        nxt = SIDES[(SIDES.index(p["side"]) + 1) % len(SIDES)] if p["side"] in SIDES else SIDES[0]
+        self.link.set_side(p["id"], nxt)
+        self.link_view_t = 0.0
+
+    def send_ghosts(self, now):
+        if not (self.link and self.link_conn and self.ai_mode) or now - self.ghost_t < 1 / GHOST_HZ:
+            return
+        hands = [[[round(q.x, 3), round(q.y, 3)] for q in tr.lm] for tr in self.engine.tracks if tr.updated and tr.lm]
+        if hands:
+            self.ghost_t = now
+            self.link.send_ghost(hands, self.engine.holder is not None)
 
     # ---------- hand logic (typing) ----------
     def aim_for(self, h):
@@ -1246,15 +1652,22 @@ class AirTyper:
             self.engine_reset = False
             for e in self.engine.reset(now):
                 self.handle(e, now)
-        self.engine.menu = self.show_shelf and self.ai_mode
+        self.engine.menu = (self.show_shelf or self.show_link) and self.ai_mode
+        self.engine.menu_poses = {"rock", "thumbs_up", "thumbs_down"} if self.show_link else {"rock"}
+        self.engine.menu_push = self.show_link
         for e in self.engine.update([lm for lm, _ in hands], now, self.ai_mode):
             self.handle(e, now)
-        if self.engine.menu and self.shelf:
-            # hand height picks a shelf item; frozen while the hand closes so the catch takes what you saw
+        rows = len(self.shelf) if self.show_shelf else len(self.link_view) if self.show_link else 0
+        if self.engine.menu and rows:
+            # hand height picks a row; frozen while the hand closes so a catch takes what you saw
             tr = next((tr for tr in self.engine.tracks if tr.updated and tr.id != self.engine.holder), None)
             if tr is not None and tr.last.up4 >= 3:
-                y = float(np.clip((tr.last.center[1] - 0.25) / 0.5, 0, 0.999))
-                self.shelf_sel = int(y * len(self.shelf))
+                sel = int(float(np.clip((tr.last.center[1] - 0.25) / 0.5, 0, 0.999)) * rows)
+                if self.show_shelf:
+                    self.shelf_sel = sel
+                else:
+                    self.link_sel = sel
+        self.send_ghosts(now)
 
         if self.ai_mode:
             for h in self.hands.values():
@@ -1318,7 +1731,7 @@ class AirTyper:
         return self.f_key if len(lab) == 1 else self.f_small
 
     def base_for(self, layout):
-        key = (layout, self.shift, self.mode) if layout == "type" else (layout,)
+        key = (layout, self.shift, self.mode) if layout == "type" else (layout, self.help_page)
         if key in self.base_cache:
             return self.base_cache[key]
         W, H, pad = self.W, self.heights[layout], self.pad
@@ -1338,7 +1751,8 @@ class AirTyper:
                 texts.append(((x0 + x1) / 2, (y0 + y1) / 2, lab, col, self.font_for(lab), "mm"))
         elif layout == "help":
             y = self.header_h + 6
-            for name, action in self.help_rows:
+            texts.append((W - pad - 2, 22, f"page {self.help_page + 1}/2 · ? next", MUTED, self.f_small, "rm"))
+            for name, action in self.help_pages[self.help_page]:
                 if action is None:
                     y += 8
                     texts.append((pad + 2, y + 9, name.upper(), ACCENT, self.f_btn, "lm"))
@@ -1348,8 +1762,10 @@ class AirTyper:
                     texts.append((W - pad - 2, y + self.help_row_h / 2, action, MUTED, self.f_small, "rm"))
                     y += self.help_row_h
             cv2.line(img, (pad, H - 46), (W - pad, H - 46), LINE, 1)
-            texts.append((pad + 2, H - 32, "Ctrl+Alt +  A gestures · G guide · H hide · Q quit", MUTED, self.f_small, "lm"))
-            texts.append((pad + 2, H - 14, "Up/Down sensitivity · R re-centre · F9 record", MUTED, self.f_small, "lm"))
+            texts.append((pad + 2, H - 32, "Ctrl+Alt +  A gestures · G guide · V shelf · L Link · K Link off",
+                          MUTED, self.f_small, "lm"))
+            texts.append((pad + 2, H - 14, "H hide · Q quit · Up/Down sensitivity · R re-centre · F9 record",
+                          MUTED, self.f_small, "lm"))
         out = self.render_text(img, texts)
         self.base_cache[key] = out
         return out
@@ -1417,9 +1833,13 @@ class AirTyper:
     def draw(self, frame, now, fps):
         img = self.base_for(self.layout).copy()
         texts = []
-        states = {"gest": self.ai_mode, "hands": self.dual, "help": self.show_help, "clips": self.show_shelf}
+        self.link_hits = []
+        states = {"gest": self.ai_mode, "hands": self.dual, "help": self.show_help, "clips": self.show_shelf,
+                  "link": self.show_link}
         labels = {"close": "×", "gest": "Gestures", "hands": "2H" if self.dual else "1H", "help": "?",
-                  "clips": "Clips"}
+                  "clips": "Clips", "link": "Link"}
+        if self.link_conn:  # linked: a dot after the title
+            cv2.circle(img, (int(self.pad + 13 + self.f_title.getlength("AirTyper")), 23), 4, ACCENT, -1, cv2.LINE_AA)
         for name, (x0, y0, x1, y1) in self.buttons_by[self.layout].items():
             on = states.get(name, False)
             rrect(img, x0, y0, x1, y1, 8, ACCENT if on else SURF2)
@@ -1432,8 +1852,10 @@ class AirTyper:
             self.draw_control(img, frame, texts, now, fps)
         elif self.layout == "shelf":
             self.draw_shelf(img, frame, texts, now, fps)
+        elif self.layout == "link":
+            self.draw_link(img, frame, texts, now, fps)
 
-        if self.toast and now - self.toast_t < 1.6 and self.layout != "help":
+        if self.toast and now - self.toast_t < self.toast_dur and self.layout != "help":
             tw = int(self.f_sug.getlength(self.toast)) + 28
             x0, y0 = (self.W - tw) // 2, self.cam_y + 30
             rrect(img, x0, y0, x0 + tw, y0 + 28, 14, SURF2)
@@ -1564,6 +1986,7 @@ class AirTyper:
             if tag:
                 texts.append((pad + c[0], self.cam_y + max(14, c[1] - 44), tag, col, self.f_btn, "mm"))
 
+        self.draw_ghosts(roi, local, texts, now)
         if self.fx_catch and now - self.fx_catch < 0.35:
             p = (now - self.fx_catch) / 0.35
             tr = self.engine.track(self.engine.holder)
@@ -1598,6 +2021,30 @@ class AirTyper:
             texts.append((x0 + 16, y0 + 37, self.pose_action_name(g), TEXT, self.f_body, "lm"))
             rrect(img, x0 + 16, y1 - 10, x1 - 16, y1 - 7, 1, SURF2)
             rrect(img, x0 + 16, y1 - 10, x0 + 16 + max(3, (x1 - x0 - 32) * p), y1 - 7, 1, AMBER)
+        elif self.incoming and now - self.incoming[1] < INCOMING_FRESH and self.engine.holder is None:
+            item = self.incoming[0]
+            rrect(img, x0, y0, x1, y1, 12, AMBER, 1)
+            hint = "catch to take · click to copy"
+            if item.get("risky"):
+                hint = "program file: only if you trust them"
+            texts.append((x0 + 16, y0 + 18, f"From {item['from']}", AMBER, self.f_btn, "lm"))
+            texts.append((x1 - 16, y0 + 18, hint, RED if item.get("risky") else MUTED, self.f_small, "rm"))
+            right = x1 - 16
+            if item.get("url"):
+                bx0 = x1 - 66
+                rrect(img, bx0, y0 + 28, x1 - 12, y0 + 50, 8, ACCENT)
+                texts.append(((bx0 + x1 - 12) / 2, y0 + 39, "Open", BG, self.f_btn, "mm"))
+                self.link_hits.append((bx0, y0 + 28, x1 - 12, y0 + 50, self.open_incoming_url))
+                right = bx0 - 8
+            texts.append((x0 + 16, y0 + 39, self.trim(item["label"], self.f_sug, right - x0 - 16), TEXT, self.f_sug, "lm"))
+            self.link_hits.append((x0, y0, x1, y1, lambda: self.take_incoming(hold=False)))
+        elif (tx := next((v for v in self.transfers.values() if not v.get("done") and now - v.get("t", 0) < 15), None)):
+            verb = "Sending to" if tx["dir"] == "out" else "Receiving from"
+            texts.append((x0 + 16, y0 + 18, "LINK", ACCENT, self.f_btn, "lm"))
+            texts.append((x1 - 16, y0 + 18, f"{tx['frac'] * 100:.0f}%", MUTED, self.f_small, "rm"))
+            texts.append((x0 + 16, y0 + 37, f"{verb} {tx['name']}", TEXT, self.f_body, "lm"))
+            rrect(img, x0 + 16, y1 - 10, x1 - 16, y1 - 7, 1, SURF2)
+            rrect(img, x0 + 16, y1 - 10, x0 + 16 + max(3, (x1 - x0 - 32) * tx["frac"]), y1 - 7, 1, ACCENT)
         elif title and now - t_act < 1.8:
             fade = max(0.0, (now - t_act - 1.2) / 0.6)
             cv2.circle(img, (x0 + 22, (y0 + y1) // 2), 5, mix(ACCENT, SURF, fade), -1, cv2.LINE_AA)
@@ -1617,7 +2064,9 @@ class AirTyper:
                 texts.append((x0 + 16, y0 + 20, "Copying…", AMBER, self.f_btn, "lm"))
             else:
                 texts.append((x0 + 16, y0 + 18, "CARRYING" if self.carrying else "HOLDING", AMBER, self.f_btn, "lm"))
-                hint = "flick open to drop here" if self.carrying else "move the fist · flick open"
+                hot = self.portal_hot() if self.carrying else None
+                hint = (f"flick open: throw to {hot[1]}" if hot else "flick open to drop here") if self.carrying \
+                    else "move the fist · flick open"
                 texts.append((x1 - 16, y0 + 18, hint, MUTED, self.f_small, "rm"))
                 prev = self.trim(" ".join(self.held_text.split()), self.f_sug, x1 - x0 - 40)
                 texts.append((x0 + 16, y0 + 39, f"“{prev}”" if prev else "(empty)", TEXT, self.f_sug, "lm"))
@@ -1632,6 +2081,7 @@ class AirTyper:
 
     @staticmethod
     def trim(s, font, maxw):
+        s = s[:300]  # a huge copied text must not reach the font measurer (it rejects >1M chars)
         if font.getlength(s) <= maxw:
             return s
         while s and font.getlength(s + "…") > maxw:
@@ -1645,6 +2095,7 @@ class AirTyper:
         for tr in self.engine.tracks:
             if tr.updated and tr.lm is not None:
                 self.draw_skeleton(roi, local, tr.lm, AMBER if tr.id == self.engine.holder else ACCENT_DIM)
+        self.draw_ghosts(roi, local, texts, now)
         self.cam_status(texts, cam_h, fps, now, "Shelf", AMBER)
         y = self.shelf_y
         texts.append((pad + 2, y + 10, "Clipboard shelf", TEXT, self.f_body, "lm"))
@@ -1652,8 +2103,8 @@ class AirTyper:
         y += 28
         if not self.shelf:
             texts.append((W / 2, y + 40, "Nothing caught yet", MUTED, self.f_body, "mm"))
-            texts.append((W / 2, y + 62, "Text you catch lands here", MUTED, self.f_small, "mm"))
-        for i, text in enumerate(self.shelf):
+            texts.append((W / 2, y + 62, "Things you catch, or friends throw you, land here", MUTED, self.f_small, "mm"))
+        for i, item in enumerate(self.shelf):
             y0 = y + i * self.shelf_row
             y1 = y0 + self.shelf_row - 6
             sel = i == self.shelf_sel
@@ -1661,22 +2112,112 @@ class AirTyper:
             if sel:
                 rrect(img, pad, y0, W - pad, y1, 9, ACCENT, 1)
             texts.append((pad + 14, (y0 + y1) / 2, str(i + 1), ACCENT if sel else MUTED, self.f_btn, "lm"))
-            prev = self.trim(" ".join(text.split()), self.f_sug, W - 2 * pad - 50)
+            tag_w = 0
+            if item.get("from"):
+                tag = f"from {item['from']}"
+                tag_w = int(self.f_small.getlength(tag)) + 12
+                texts.append((W - pad - 10, (y0 + y1) / 2, tag, GHOST, self.f_small, "rm"))
+            prev = self.trim(item["label"], self.f_sug, W - 2 * pad - 50 - tag_w)
             texts.append((pad + 34, (y0 + y1) / 2, prev, TEXT if sel else MUTED, self.f_sug, "lm"))
         texts.append((W / 2, self.heights["shelf"] - 16, "Win+V  everything you copied (Windows clipboard history)",
                       MUTED, self.f_small, "mm"))
 
-    def chip_setup(self):
-        cv2.namedWindow(CHIP, cv2.WINDOW_AUTOSIZE)
-        cv2.imshow(CHIP, np.full((30, 120, 3), BG, np.uint8))
+    def draw_ghosts(self, roi, local, texts, now):
+        """A linked friend's hands, streamed as 21 points each (never their camera image)."""
+        for pid, (hands, holding, t) in list(self.ghosts.items()):
+            age = now - t
+            if age > 0.6:
+                continue
+            col = mix(AMBER if holding else GHOST, SURF, min(1.0, age / 0.6) * 0.7)
+            for pts in hands:
+                if len(pts) != 21:
+                    continue
+                q = [local(x, y) for x, y in pts]
+                for a, b in HAND_BONES:
+                    cv2.line(roi, q[a], q[b], col, 1, cv2.LINE_AA)
+                texts.append((self.pad + q[0][0], self.cam_y + min(q[0][1] + 14, roi.shape[0] - 8),
+                              self.peer_name(pid), col, self.f_small, "mm"))
+
+    def draw_link(self, img, frame, texts, now, fps):
+        W, pad = self.W, self.pad
+        cam_h = self.cam_h_type
+        roi, local = self.draw_camera(img, frame, cam_h)
+        for tr in self.engine.tracks:
+            if tr.updated and tr.lm is not None:
+                self.draw_skeleton(roi, local, tr.lm, ACCENT_DIM)
+        self.draw_ghosts(roi, local, texts, now)
+        self.cam_status(texts, cam_h, fps, now, "Link", ACCENT)
+        y = self.shelf_y
+        texts.append((pad + 2, y + 10, "Nearby devices", TEXT, self.f_body, "lm"))
+        texts.append((W - pad - 2, y + 10, "hand up / down · push = pair", MUTED, self.f_small, "rm"))
+        y += 28
+        H = self.heights["link"]
+        if not self.link:
+            msg = "Link is off" if not self.link_enabled else "Link could not start"
+            texts.append((W / 2, y + 40, msg, MUTED, self.f_body, "mm"))
+            texts.append((W / 2, y + 62, "Ctrl+Alt+K to turn it on", MUTED, self.f_small, "mm"))
+        elif not self.link_view:
+            dots = "." * (int(now * 2) % 4)
+            texts.append((W / 2, y + 40, "Looking for AirTyper on this network" + dots, TEXT, self.f_body, "mm"))
+            texts.append((W / 2, y + 62, "Open AirTyper on your friend's laptop, same Wi-Fi", MUTED, self.f_small, "mm"))
+            texts.append((W / 2, y + 80, "Allow it in the Windows Firewall prompt (Private networks)", MUTED,
+                          self.f_small, "mm"))
+        for i, p in enumerate(self.link_view[:4]):
+            y0 = y + i * self.link_row
+            y1 = y0 + self.link_row - 6
+            sel = i == self.link_sel
+            rrect(img, pad, y0, W - pad, y1, 10, SURF2 if sel else SURF)
+            if sel:
+                rrect(img, pad, y0, W - pad, y1, 10, ACCENT, 1)
+            dot = ACCENT if p["connected"] else (MUTED if p["online"] else LINE)
+            cv2.circle(img, (pad + 16, y0 + 18), 4, dot, -1, cv2.LINE_AA)
+            texts.append((pad + 28, y0 + 18, p["name"], TEXT, self.f_body, "lm"))
+            buttons = []  # (label, fn, primary)
+            if p["pair"] == "code":
+                status = f"Code  {p['sas'][:3]} {p['sas'][3:]}  ·  same on both screens?"
+                buttons = [("Cancel", lambda p=p: self.link.cancel_pair(p["id"]), False)]
+                if not p["confirmed"]:
+                    buttons.append(("Confirm", lambda p=p: self.link_primary(p), True))
+                else:
+                    status = f"Code  {p['sas'][:3]} {p['sas'][3:]}  ·  waiting for them"
+            elif p["pair"] == "incoming":
+                status = "Wants to pair with you"
+                buttons = [("Decline", lambda p=p: self.link.cancel_pair(p["id"]), False),
+                           ("Accept", lambda p=p: self.link_primary(p), True)]
+            elif p["pair"] == "waiting":
+                status = "Waiting for them to accept…"
+                buttons = [("Cancel", lambda p=p: self.link.cancel_pair(p["id"]), False)]
+            elif p["paired"]:
+                status = f"Connected · throw to the {p['side']} edge" if p["connected"] else "Paired · offline"
+                buttons = [("Unpair", lambda p=p: self.link.unpair(p["id"]), False)]
+                if p["connected"]:
+                    buttons.append((f"{p['side'].capitalize()} edge", lambda p=p: self.link_cycle_side(p), False))
+            else:
+                status = "Nearby · push or click Pair"
+                buttons = [("Pair", lambda p=p: self.link_primary(p), True)]
+            code = p["pair"] == "code"
+            texts.append((pad + 28, y0 + 38, status, AMBER if code else MUTED, self.f_btn if code else self.f_small, "lm"))
+            bx = W - pad - 10
+            for label, fn, primary in reversed(buttons):
+                bw = int(self.f_btn.getlength(label)) + 20
+                rrect(img, bx - bw, y0 + 8, bx, y0 + 30, 8, ACCENT if primary else SURF2 if not sel else SURF)
+                texts.append((bx - bw / 2, y0 + 19, label, BG if primary else TEXT, self.f_btn, "mm"))
+                self.link_hits.append((bx - bw, y0 + 8, bx, y0 + 30, fn))
+                bx -= bw + 6
+        if self.link:
+            texts.append((W / 2, H - 16, f"This laptop: {self.link_name} · {self.link_ips}", MUTED, self.f_small, "mm"))
+
+    def make_overlay(self, name):
+        """A borderless, click-through, never-focused topmost window (hidden until used)."""
+        cv2.namedWindow(name, cv2.WINDOW_AUTOSIZE)
+        cv2.imshow(name, np.full((30, 120, 3), BG, np.uint8))
         cv2.waitKey(1)
-        hwnd = user32.FindWindowW(None, CHIP)
+        hwnd = user32.FindWindowW(None, name)
         if not hwnd:
-            return
+            return None
         style = user32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF
         style &= ~(0x00C00000 | 0x00040000 | 0x00080000 | 0x00020000 | 0x00010000)
         user32.SetWindowLongW(hwnd, -16, ctypes.c_long(style).value)
-        # no focus, topmost, no taskbar button, layered + click-through
         ex = (user32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF) | 0x08000000 | 0x8 | 0x80 | 0x80000 | 0x20
         user32.SetWindowLongW(hwnd, -20, ctypes.c_long(ex).value)
         user32.SetLayeredWindowAttributes(hwnd, 0, 240, 2)
@@ -1685,6 +2226,52 @@ class AirTyper:
         except Exception:
             pass
         user32.ShowWindow(hwnd, 0)
+        return hwnd
+
+    def portal_update(self):
+        """While carrying, glowing drop zones show at the edges where linked friends sit."""
+        want = {}
+        if self.carrying and self.engine.holder is not None and self.link_conn:
+            hot = self.portal_hot()
+            for pid, name, side in self.link_conn:
+                want.setdefault(side, (name, bool(hot and hot[0] == pid)))
+        x0, y0, x1, y1 = self.screen_rect()
+        for side in SIDES:
+            pw = self.portals.get(side)
+            if side not in want:
+                if pw and pw["shown"]:
+                    user32.ShowWindow(pw["hwnd"], 0)
+                    pw["shown"] = False
+                continue
+            if pw is None:
+                pw = self.portals[side] = {"hwnd": self.make_overlay(f"{PORTAL} {side}"), "key": None, "shown": False}
+            if not pw["hwnd"]:
+                continue
+            name, hot = want[side]
+            key = (name, hot)
+            if pw["key"] != key:
+                arrow = {"right": "→", "left": "←", "top": "↑"}[side]
+                w, h = 210, 64
+                img = np.full((h, w, 3), BG, np.uint8)
+                rrect(img, 0, 0, w - 1, h - 1, 14, ACCENT if hot else SURF2)
+                rrect(img, 0, 0, w - 1, h - 1, 14, ACCENT, 2)
+                col = BG if hot else TEXT
+                pw["img"] = self.render_text(img, [
+                    (w / 2, 24, f"{arrow}  {name}", col, self.f_body, "mm"),
+                    (w / 2, 45, "let go to throw" if hot else "carry here to throw", BG if hot else MUTED,
+                     self.f_small, "mm")])
+                pw["key"] = key
+                cv2.imshow(f"{PORTAL} {side}", pw["img"])
+            h, w = pw["img"].shape[:2]
+            cy, cx = (y0 + y1) // 2, (x0 + x1) // 2
+            pos = {"right": (x1 - w - 6, cy - h // 2), "left": (x0 + 6, cy - h // 2), "top": (cx - w // 2, y0 + 6)}[side]
+            user32.SetWindowPos(pw["hwnd"], wintypes.HWND(-1), pos[0], pos[1], w, h, 0x0010 | 0x0040)
+            pw["shown"] = True
+
+    def chip_setup(self):
+        hwnd = self.make_overlay(CHIP)
+        if not hwnd:
+            return
         self.chip_hwnd = hwnd
 
     def chip_update(self):
@@ -1728,6 +2315,8 @@ class AirTyper:
             pass
         tracker = Tracker()
         tracker.start()
+        if self.link_enabled:
+            self.link_start()
         print("AirTyper running. Click the window you want to type into. Ctrl+Alt+Q to quit.", flush=True)
         last_seq, first = -1, True
         last = time.perf_counter()
@@ -1768,6 +2357,7 @@ class AirTyper:
                     last_seq = seq
                     self.on_detection(hands, now)
                 self.poll_copy(now)
+                self.pump_link(now)
                 self.input_tick(now, dt)
 
                 # ease the drawn typing cursor toward the filtered target
@@ -1787,18 +2377,29 @@ class AirTyper:
                 if self.show_help:
                     layout = "help"
                 elif self.ai_mode:
-                    layout = "shelf" if self.show_shelf else "control"
+                    layout = "link" if self.show_link else "shelf" if self.show_shelf else "control"
                 else:
                     layout = "type"
                 if layout != self.layout:
                     self.set_layout(layout)
 
-                out = self.draw(frame, now, fps)
+                try:
+                    out = self.draw(frame, now, fps)
+                except Exception:  # a drawing glitch must never close the app: log it, keep the last frame
+                    import traceback
+                    msg = traceback.format_exc()
+                    if msg != getattr(self, "_last_draw_error", None):
+                        self._last_draw_error = msg
+                        print(time.strftime("[%Y-%m-%d %H:%M:%S] draw error\n") + msg, flush=True)
+                    if first:
+                        raise
+                    continue
                 if first:
                     self.setup_window(out)
                     first = False
                 cv2.imshow(WIN, out)
                 self.chip_update()
+                self.portal_update()
                 cv2.waitKey(1)
         finally:
             try:
@@ -1810,6 +2411,7 @@ class AirTyper:
                     self.mouse.release(Button.left)
             if self.rec:
                 self.rec.close()
+            self.link_stop()
             self.save_settings()
             tracker.alive = False
             tracker.join(timeout=2)

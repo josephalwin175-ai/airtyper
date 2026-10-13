@@ -204,7 +204,9 @@ class Engine:
         self.tracks = []
         self.holder = None      # id of the track holding a caught item
         self.zoom_ref = None
-        self.menu = False       # a menu (clipboard shelf) is open: hand height picks, only catch/rock/2-finger swipes
+        self.menu = False       # a menu (shelf, Link panel) is open: hand height picks, only catch/rock/2-finger swipes
+        self.menu_poses = {"rock"}  # poses that still fire while a menu is open
+        self.menu_push = False      # push toward the camera works in the menu (open-hand swipes never do)
 
     def reset(self, now):
         """Mode switch: forget in-progress gestures. The current pose must be released and re-made."""
@@ -285,8 +287,9 @@ class Engine:
                 self._carry(tr, f, now, ev)
             if self.menu and not tr.pointer:
                 if tr.id != self.holder:
-                    self._motions(tr, f, now, ev, kinds=("two",))
-                    self._poses(tr, f, now, ev, allowed={"rock"})
+                    self._motions(tr, f, now, ev, kinds=("two", "palm") if self.menu_push else ("two",),
+                                  palm_swipes=False)
+                    self._poses(tr, f, now, ev, allowed=self.menu_poses)
                 continue
             if tr.pointer:
                 self._pointer(tr, f, now, ev)
@@ -341,7 +344,7 @@ class Engine:
             tr.closed_run = 0
 
     # ---------- swipes / push ----------
-    def _motions(self, tr, f, now, ev, kinds=("palm", "two")):
+    def _motions(self, tr, f, now, ev, kinds=("palm", "two"), palm_swipes=True):
         if now < tr.motion_until:
             return
         kind = motion_kind(f)
@@ -361,6 +364,8 @@ class Engine:
             dirn = "right" if dx > 0 else "left"
         elif abs(dy) >= SWIPE_DIST_V and abs(dy) >= SWIPE_AXIS * abs(dx):
             dirn = "down" if dy > 0 else "up"
+        if dirn and kind == "palm" and not palm_swipes:
+            dirn = None
         if dirn:
             tr.anchor = now
             if now < tr.block.get(dirn, 0):

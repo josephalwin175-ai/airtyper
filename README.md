@@ -94,6 +94,24 @@ Terminals get `Ctrl+Shift+C` / `Ctrl+Shift+V`, so a catch never sends Ctrl+C to 
 
 Three sections: `poses` (held shapes), `motions` (`swipe_left`, `swipe_right`, `swipe_up`, `swipe_down`, `two_swipe_left`, `two_swipe_right`, `push`, `zoom_in`, `zoom_out`), and `per_app` (overrides keyed by process name, such as `"chrome.exe"`). Each entry has a `name` and either `run` (a program path, a URL, or a `shell:AppsFolder\...` ID) or `keys` (for example `"ctrl+shift+t"`, `"media_next"`). Restart AirTyper after editing. Old single-level files are converted automatically.
 
+## Link: throw things between two laptops
+
+Install AirTyper on both laptops and join the same Wi-Fi. Nothing else is needed: no account, no server, no cables.
+
+1. **Pair once.** Open the Link panel on both laptops (two-finger swipe up, the **Link** button, or `Ctrl+Alt+L`). Your friend's laptop appears under *Nearby devices*. Push your hand toward the camera (or click **Pair**), and your friend pushes (or clicks **Accept**). If you both push at the same moment, that counts too. Both screens then show a 6-digit code. If they match, both give a thumbs up (or click **Confirm**). From then on the laptops find and reconnect to each other by themselves.
+2. **Throw.** Catch something (text, a link, a screenshot, or files and folders selected in Explorer) and carry it with your fist to the screen edge where your friend sits. A glowing portal with their name appears there. Flick your hand open inside it and the item flies to their laptop. The edge is set per friend (right, left or top; click the edge button in the Link panel to change it).
+3. **Catch.** On your friend's laptop the item appears on the gesture card: *From Joseph*. They catch it (open hand → fist) and it's in their fist, ready to carry and drop anywhere, so files paste into Explorer as real files. Clicking the card copies it instead, and links get an **Open** button. Everything thrown also lands on the clipboard shelf, tagged with who sent it. The sender sees *Arjun caught it*.
+4. **Ghost hands.** While linked, each of you sees the other's hands as a faint purple skeleton in the camera panel. Only 21 points per hand are sent, never camera images.
+
+**Safety.** Pairing pins each laptop's key. The 6-digit code check means nobody else on the network can listen in or pretend to be your friend, and every connection is encrypted (X25519 + ChaCha20-Poly1305). Nothing opens or pastes by itself: the receiver always catches or clicks. Items copied from password managers never leave your laptop. Program files (`.exe`, `.bat`, scripts…) are flagged on the card. Received files are saved in `%LOCALAPPDATA%\AirTyper\Received`. `Ctrl+Alt+K` turns Link off; unpair from the Link panel.
+
+**If your friend doesn't show up:**
+- Allow AirTyper when the Windows Firewall prompt appears (Private networks). If you dismissed it, allow `pythonw.exe` in *Windows Security → Firewall → Allow an app*.
+- Both laptops' Wi-Fi should be set to *Private network* in Windows settings.
+- Campus, hotel and café Wi-Fi often block devices from seeing each other. Use a phone hotspot or turn on *Mobile hotspot* on one laptop instead.
+- Or add your friend's IP (shown at the bottom of their Link panel) to `settings.json`: `"link_manual": ["192.168.1.23"]`.
+- Change the name others see with `"link_name"` in `settings.json`.
+
 ## Window and hotkeys
 
 Drag the header to move the window; it keeps its bottom edge when it switches between the typing and gesture layouts. The **×** button closes AirTyper.
@@ -106,7 +124,9 @@ Drag the header to move the window; it keeps its bottom edge when it switches be
 | D | one / two hands |
 | A | gesture mode |
 | V | clipboard shelf |
-| G | gesture guide |
+| L | Link panel |
+| K | Link on / off |
+| G | gesture guide (press again for page 2) |
 | H | hide / show |
 | F9 | start / stop recording hand data |
 | Q | quit |
@@ -129,6 +149,7 @@ To tune with real data, record with `Ctrl+Alt+F9`, then replay it through the en
 | `airtyper.py` | the app |
 | `gesture_engine.py` | gesture recognition (no Windows calls, replayable) |
 | `replay.py` | replay recordings / self-test the engine |
+| `link.py` | Link: discovery, pairing, encrypted transfers (`python link.py --selftest`) |
 | `gestures.json` | gesture → action mapping |
 | `settings.json` | saved window position, sensitivity, mode |
 | `assets/airtyper.ico` | app icon (regenerate with `make_icon.py`) |

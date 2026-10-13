@@ -65,6 +65,10 @@
     "two_swipe_down": {
       "name": "Clipboard shelf",
       "action": "shelf"
+    },
+    "two_swipe_up": {
+      "name": "Link",
+      "action": "link"
     }
   },
   "per_app": {

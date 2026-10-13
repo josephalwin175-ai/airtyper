@@ -10,8 +10,6 @@ import json
 import sys
 from types import SimpleNamespace
 
-import numpy as np
-
 from gesture_engine import Engine
 
 FPS = 30
